@@ -4,13 +4,12 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 import asyncio
 import os
-from typing import Optional
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
 
-# ========== DEFAULT CONFIGURATION ==========
+# ========== CONFIGURATION ==========
 DEFAULT_CONFIG = {
     "enabled": True,
     "max_bans": 3,
@@ -231,7 +230,7 @@ async def on_member_join(member):
             color=discord.Color.green()
         ))
 
-    # If raid mode is active, kick the new member (optional, add if you want auto-kick)
+    # If raid mode is active, kick the new member
     if cfg["raid_mode"]:
         try:
             await member.kick(reason="Raid mode active – auto protection")
@@ -301,65 +300,81 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
         if len(recent_webhooks) >= cfg["max_webhook_creates"]:
             await purge_all_webhooks(guild)
 
-# -------------------- LOCKDOWN COMMAND (OWNER ONLY) --------------------
+# -------------------- LOCKDOWN / UNLOCKDOWN (FIXED) --------------------
 @bot.tree.command(name="lockdown", description="Lock down the server: disable messages, delete webhooks")
 async def lockdown_cmd(interaction: discord.Interaction):
-    # Only the server owner can use this
+    # Owner only
     if interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
         return
 
-    await interaction.response.send_message("🔒 **Lockdown initiated...** (this may take a moment)", ephemeral=False)
+    # Permission check
+    me = interaction.guild.me
+    missing = []
+    if not me.guild_permissions.manage_channels:
+        missing.append("Manage Channels")
+    if not me.guild_permissions.manage_webhooks:
+        missing.append("Manage Webhooks")
+    if missing:
+        await interaction.response.send_message(f"❌ Bot is missing permissions: {', '.join(missing)}", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False)
 
     guild = interaction.guild
     locked_channels = 0
+    failed_channels = 0
     deleted_webhooks = 0
+    errors = []
 
-    # Lock all text channels (disable send_messages for @everyone)
+    # 1. Lock text channels
     for channel in guild.text_channels:
         try:
+            # Get current overwrite for @everyone
             overwrite = channel.overwrites_for(guild.default_role)
             overwrite.send_messages = False
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
             locked_channels += 1
+        except Exception as e:
+            failed_channels += 1
+            errors.append(f"#{channel.name}: {str(e)[:50]}")
+
+    # 2. Delete all webhooks
+    for channel in guild.text_channels:
+        try:
+            webhooks = await channel.webhooks()
+            for webhook in webhooks:
+                await webhook.delete()
+                deleted_webhooks += 1
         except:
             pass
 
-    # Delete all webhooks
-    for channel in guild.text_channels:
-        webhooks = await channel.webhooks()
-        for webhook in webhooks:
-            try:
-                await webhook.delete()
-                deleted_webhooks += 1
-            except:
-                pass
-
-    # Optional: Lock voice channels (disconnect members, disable connect)
+    # 3. Disconnect all voice users and deny connect
     for channel in guild.voice_channels:
         try:
+            # Disconnect members
+            for member in channel.members:
+                await member.move_to(None)
+            # Deny connect for @everyone
             overwrite = channel.overwrites_for(guild.default_role)
             overwrite.connect = False
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
-            # Disconnect members already in the channel
-            for member in channel.members:
-                await member.move_to(None)
         except:
             pass
 
     embed = discord.Embed(
         title="🔒 **SERVER LOCKDOWN COMPLETE**",
-        description=f"**Action taken by:** {interaction.user.mention}\n"
-                    f"🔒 **Channels locked:** {locked_channels}\n"
+        description=f"**Issued by:** {interaction.user.mention}\n"
+                    f"🔒 **Channels locked:** {locked_channels} (failed: {failed_channels})\n"
                     f"🧹 **Webhooks deleted:** {deleted_webhooks}\n"
                     f"🔊 **Voice channels disabled**",
         color=discord.Color.dark_red(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.set_footer(text="Use /unlockdown to restore permissions")
-    await interaction.followup.send(embed=embed)
+    if errors:
+        embed.add_field(name="⚠️ Some channels failed", value="\n".join(errors[:5]), inline=False)
 
-    # Also send to log channel if set
+    await interaction.followup.send(embed=embed)
     await log_to_channel(guild.id, embed)
 
 @bot.tree.command(name="unlockdown", description="Unlock the server (restore @everyone send_messages)")
@@ -368,7 +383,12 @@ async def unlockdown_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
         return
 
-    await interaction.response.send_message("🔓 **Unlocking server...**", ephemeral=False)
+    me = interaction.guild.me
+    if not me.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ Bot is missing `Manage Channels` permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False)
 
     guild = interaction.guild
     unlocked_channels = 0
@@ -376,13 +396,14 @@ async def unlockdown_cmd(interaction: discord.Interaction):
     for channel in guild.text_channels:
         try:
             overwrite = channel.overwrites_for(guild.default_role)
-            overwrite.send_messages = None  # Reset to default (usually allowed via @everyone)
+            # Remove the explicit deny; revert to default (usually allowed via @everyone)
+            overwrite.send_messages = None
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
             unlocked_channels += 1
         except:
             pass
 
-    # Re-enable voice channel connections
+    # Re-enable voice connect
     for channel in guild.voice_channels:
         try:
             overwrite = channel.overwrites_for(guild.default_role)
@@ -393,7 +414,7 @@ async def unlockdown_cmd(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="🔓 **SERVER UNLOCKED**",
-        description=f"**Action taken by:** {interaction.user.mention}\n"
+        description=f"**Issued by:** {interaction.user.mention}\n"
                     f"🔓 **Channels unlocked:** {unlocked_channels}\n"
                     f"🔊 **Voice channels re-enabled**",
         color=discord.Color.green(),
