@@ -143,7 +143,6 @@ async def check_and_punish(guild, user, action_type, count=1):
     tracker = action_tracker[guild.id][user.id]
     for _ in range(count):
         tracker.append((now, action_type))
-    # Remove old entries
     while tracker and tracker[0][0] < now - window:
         tracker.popleft()
     total = sum(1 for _, t in tracker if t == action_type)
@@ -152,7 +151,6 @@ async def check_and_punish(guild, user, action_type, count=1):
         action_tracker[guild.id][user.id].clear()
 
 async def restore_deleted_channel(guild, entry):
-    """Restore channel with original name, category, and permission overwrites."""
     try:
         name = getattr(entry.extra, 'name', 'restored-channel')
         category_id = getattr(entry.extra, 'category_id', None)
@@ -206,71 +204,7 @@ async def purge_all_webhooks(guild):
             color=discord.Color.orange()
         ))
 
-# -------------------- AUDIT LOG MONITORING --------------------
-@bot.event
-async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
-    guild = entry.guild
-    user = entry.user
-    if user == bot.user:
-        return
-
-    cfg = get_config(guild.id)
-
-    # Mapping of audit actions to our internal action names and weight (count)
-    action_info = {
-        discord.AuditLogAction.ban: ("ban", 1),
-        discord.AuditLogAction.kick: ("kick", 1),
-        discord.AuditLogAction.channel_delete: ("channel_delete", 1),
-        discord.AuditLogAction.role_delete: ("role_delete", 1),
-        discord.AuditLogAction.webhook_create: ("webhook_create", 1),
-        discord.AuditLogAction.integration_create: ("integration_create", 1),
-        discord.AuditLogAction.channel_create: ("channel_create", 1),
-        discord.AuditLogAction.role_create: ("role_create", 1),
-        discord.AuditLogAction.overwrite_create: ("permission_update", 1),
-        discord.AuditLogAction.overwrite_update: ("permission_update", 1),
-        discord.AuditLogAction.overwrite_delete: ("permission_update", 1),
-    }
-
-    if entry.action in action_info:
-        act, weight = action_info[entry.action]
-        await check_and_punish(guild, user, act, weight)
-
-        # Special alerts for integrations and webhooks (even if not punished yet)
-        if entry.action == discord.AuditLogAction.integration_create:
-            embed = discord.Embed(
-                title="🔌 **Integration (Authorized App) Created**",
-                description=f"**User:** {user.mention}\n**Integration Name:** {getattr(entry.target, 'name', 'Unknown')}",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await log_to_channel(guild.id, embed)
-
-        if entry.action == discord.AuditLogAction.webhook_create:
-            embed = discord.Embed(
-                title="📡 **Webhook Created**",
-                description=f"**User:** {user.mention}\n**Channel:** <#{entry.extra.channel_id if hasattr(entry.extra, 'channel_id') else 'unknown'}>",
-                color=discord.Color.orange(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await log_to_channel(guild.id, embed)
-
-    # Auto-restore channels/roles
-    if cfg["restore_channels"] and entry.action == discord.AuditLogAction.channel_delete:
-        await restore_deleted_channel(guild, entry)
-    if cfg["restore_roles"] and entry.action == discord.AuditLogAction.role_delete:
-        await restore_deleted_role(guild, entry)
-
-    # If many webhooks created, purge all webhooks
-    if cfg["purge_webhooks_on_nuke"] and entry.action == discord.AuditLogAction.webhook_create:
-        # Check if the user has just crossed the threshold
-        now = datetime.now(timezone.utc).timestamp()
-        window = cfg["time_window"]
-        tracker = action_tracker[guild.id][user.id]
-        recent_webhooks = [t for t, a in tracker if a == "webhook_create" and now - t <= window]
-        if len(recent_webhooks) >= cfg["max_webhook_creates"]:
-            await purge_all_webhooks(guild)
-
-# -------------------- RAID DETECTION --------------------
+# -------------------- RAID DETECTION & AUTO-KICK --------------------
 @bot.event
 async def on_member_join(member):
     guild = member.guild
@@ -297,7 +231,178 @@ async def on_member_join(member):
             color=discord.Color.green()
         ))
 
-# -------------------- SLASH COMMANDS WITH LOGGING --------------------
+    # If raid mode is active, kick the new member (optional, add if you want auto-kick)
+    if cfg["raid_mode"]:
+        try:
+            await member.kick(reason="Raid mode active – auto protection")
+            await log_to_channel(guild.id, discord.Embed(
+                description=f"🔨 Kicked {member.mention} during raid mode",
+                color=discord.Color.red()
+            ))
+        except:
+            pass
+
+# -------------------- AUDIT LOG MONITORING --------------------
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
+    guild = entry.guild
+    user = entry.user
+    if user == bot.user:
+        return
+
+    cfg = get_config(guild.id)
+
+    action_info = {
+        discord.AuditLogAction.ban: ("ban", 1),
+        discord.AuditLogAction.kick: ("kick", 1),
+        discord.AuditLogAction.channel_delete: ("channel_delete", 1),
+        discord.AuditLogAction.role_delete: ("role_delete", 1),
+        discord.AuditLogAction.webhook_create: ("webhook_create", 1),
+        discord.AuditLogAction.integration_create: ("integration_create", 1),
+        discord.AuditLogAction.channel_create: ("channel_create", 1),
+        discord.AuditLogAction.role_create: ("role_create", 1),
+        discord.AuditLogAction.overwrite_create: ("permission_update", 1),
+        discord.AuditLogAction.overwrite_update: ("permission_update", 1),
+        discord.AuditLogAction.overwrite_delete: ("permission_update", 1),
+    }
+
+    if entry.action in action_info:
+        act, weight = action_info[entry.action]
+        await check_and_punish(guild, user, act, weight)
+
+        if entry.action == discord.AuditLogAction.integration_create:
+            embed = discord.Embed(
+                title="🔌 **Integration (Authorized App) Created**",
+                description=f"**User:** {user.mention}\n**Integration Name:** {getattr(entry.target, 'name', 'Unknown')}",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            await log_to_channel(guild.id, embed)
+
+        if entry.action == discord.AuditLogAction.webhook_create:
+            embed = discord.Embed(
+                title="📡 **Webhook Created**",
+                description=f"**User:** {user.mention}\n**Channel:** <#{entry.extra.channel_id if hasattr(entry.extra, 'channel_id') else 'unknown'}>",
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            await log_to_channel(guild.id, embed)
+
+    if cfg["restore_channels"] and entry.action == discord.AuditLogAction.channel_delete:
+        await restore_deleted_channel(guild, entry)
+    if cfg["restore_roles"] and entry.action == discord.AuditLogAction.role_delete:
+        await restore_deleted_role(guild, entry)
+
+    if cfg["purge_webhooks_on_nuke"] and entry.action == discord.AuditLogAction.webhook_create:
+        now = datetime.now(timezone.utc).timestamp()
+        window = cfg["time_window"]
+        tracker = action_tracker[guild.id][user.id]
+        recent_webhooks = [t for t, a in tracker if a == "webhook_create" and now - t <= window]
+        if len(recent_webhooks) >= cfg["max_webhook_creates"]:
+            await purge_all_webhooks(guild)
+
+# -------------------- LOCKDOWN COMMAND (OWNER ONLY) --------------------
+@bot.tree.command(name="lockdown", description="Lock down the server: disable messages, delete webhooks")
+async def lockdown_cmd(interaction: discord.Interaction):
+    # Only the server owner can use this
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔒 **Lockdown initiated...** (this may take a moment)", ephemeral=False)
+
+    guild = interaction.guild
+    locked_channels = 0
+    deleted_webhooks = 0
+
+    # Lock all text channels (disable send_messages for @everyone)
+    for channel in guild.text_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = False
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+            locked_channels += 1
+        except:
+            pass
+
+    # Delete all webhooks
+    for channel in guild.text_channels:
+        webhooks = await channel.webhooks()
+        for webhook in webhooks:
+            try:
+                await webhook.delete()
+                deleted_webhooks += 1
+            except:
+                pass
+
+    # Optional: Lock voice channels (disconnect members, disable connect)
+    for channel in guild.voice_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.connect = False
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+            # Disconnect members already in the channel
+            for member in channel.members:
+                await member.move_to(None)
+        except:
+            pass
+
+    embed = discord.Embed(
+        title="🔒 **SERVER LOCKDOWN COMPLETE**",
+        description=f"**Action taken by:** {interaction.user.mention}\n"
+                    f"🔒 **Channels locked:** {locked_channels}\n"
+                    f"🧹 **Webhooks deleted:** {deleted_webhooks}\n"
+                    f"🔊 **Voice channels disabled**",
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text="Use /unlockdown to restore permissions")
+    await interaction.followup.send(embed=embed)
+
+    # Also send to log channel if set
+    await log_to_channel(guild.id, embed)
+
+@bot.tree.command(name="unlockdown", description="Unlock the server (restore @everyone send_messages)")
+async def unlockdown_cmd(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔓 **Unlocking server...**", ephemeral=False)
+
+    guild = interaction.guild
+    unlocked_channels = 0
+
+    for channel in guild.text_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = None  # Reset to default (usually allowed via @everyone)
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+            unlocked_channels += 1
+        except:
+            pass
+
+    # Re-enable voice channel connections
+    for channel in guild.voice_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.connect = None
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+        except:
+            pass
+
+    embed = discord.Embed(
+        title="🔓 **SERVER UNLOCKED**",
+        description=f"**Action taken by:** {interaction.user.mention}\n"
+                    f"🔓 **Channels unlocked:** {unlocked_channels}\n"
+                    f"🔊 **Voice channels re-enabled**",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    await interaction.followup.send(embed=embed)
+    await log_to_channel(guild.id, embed)
+
+# -------------------- SLASH COMMANDS (CONFIGURATION) --------------------
 async def log_setting(guild_id, user, setting, old, new):
     embed = discord.Embed(
         title="⚙️ **Anti-Nuke Setting Changed**",
@@ -311,18 +416,19 @@ async def log_setting(guild_id, user, setting, old, new):
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🛡️ **Anti-Nuke Bot – Command List**",
-        description="Use `/` to run these commands. `Administrator` permission required to change settings.",
+        description="Use `/` to run these commands. `Administrator` permission required to change settings.\n"
+                    "**Lockdown** commands are only for the server owner.",
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc)
     )
     embed.add_field(name="`/status`", value="Show current anti‑nuke settings", inline=False)
-    embed.add_field(name="`/enable`", value="Turn on protection", inline=False)
-    embed.add_field(name="`/disable`", value="Turn off protection", inline=False)
+    embed.add_field(name="`/enable` / `/disable`", value="Turn protection on/off", inline=False)
     embed.add_field(name="`/set <setting> <value>`", value="Change a setting. Example: `/set max_bans 5`", inline=False)
     embed.add_field(name="`/punishment <type>`", value="Set punishment: `ban`, `kick`, `strip_roles`, `alert`", inline=False)
     embed.add_field(name="`/setlogs #channel`", value="Set the log channel (all alerts go here)", inline=False)
-    embed.add_field(name="`/whitelist add <user/role>`", value="Whitelist a user or role (ignored by anti-nuke)", inline=False)
-    embed.add_field(name="`/whitelist remove <user/role>`", value="Remove from whitelist", inline=False)
+    embed.add_field(name="`/whitelist user/role`", value="Whitelist a user or role (ignored by anti-nuke)", inline=False)
+    embed.add_field(name="`/lockdown`", value="**Owner only** – lock all channels, delete webhooks", inline=False)
+    embed.add_field(name="`/unlockdown`", value="**Owner only** – restore channel permissions", inline=False)
     embed.add_field(name="`/ping`", value="Check bot latency", inline=False)
     embed.set_footer(text="Your server is protected 24/7 🛡️")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -418,7 +524,6 @@ async def setlogs_cmd(interaction: discord.Interaction, channel: discord.TextCha
 @bot.tree.command(name="whitelist", description="Whitelist a user or role")
 @commands.has_permissions(administrator=True)
 async def whitelist_cmd(interaction: discord.Interaction, target: str, item: str):
-    # target = "user" or "role", item = ID or mention
     cfg = get_config(interaction.guild_id)
     if target == "user":
         try:
