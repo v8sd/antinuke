@@ -24,10 +24,6 @@ DEFAULT_CONFIG = {
     "raid_join_threshold": 15,
     "raid_mode": False,
     "log_channel_id": None,
-    "admin_roles": [],
-    "whitelist_users": [],
-    "whitelist_roles": [],
-    "auto_verify_role": None
 }
 
 guild_configs = {}
@@ -43,6 +39,7 @@ intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# -------------------- HELPERS --------------------
 def get_config(guild_id):
     if guild_id not in guild_configs:
         guild_configs[guild_id] = DEFAULT_CONFIG.copy()
@@ -50,16 +47,16 @@ def get_config(guild_id):
 
 def is_whitelisted(guild_id, user_id, roles):
     cfg = get_config(guild_id)
-    if user_id in cfg["whitelist_users"]:
+    if user_id in cfg.get("whitelist_users", []):
         return True
     for role in roles:
-        if role.id in cfg["whitelist_roles"]:
+        if role.id in cfg.get("whitelist_roles", []):
             return True
     return False
 
 async def log_event(guild_id, embed):
     cfg = get_config(guild_id)
-    channel_id = cfg["log_channel_id"]
+    channel_id = cfg.get("log_channel_id")
     if channel_id:
         channel = bot.get_channel(channel_id)
         if channel:
@@ -160,6 +157,7 @@ async def purge_all_webhooks(guild):
             await webhook.delete()
     await log_event(guild.id, discord.Embed(description="🧹 Purged all webhooks", color=discord.Color.orange()))
 
+# -------------------- AUDIT LOG LISTENER --------------------
 @bot.event
 async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
     guild = entry.guild
@@ -181,7 +179,11 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
             await create_backup_channel(guild, entry)
         elif entry.action == discord.AuditLogAction.role_delete and cfg["restore_roles"]:
             await create_backup_role(guild, entry)
+        elif entry.action == discord.AuditLogAction.webhook_create and cfg["purge_webhooks"]:
+            # If many webhooks created quickly, purge all
+            await purge_all_webhooks(guild)
 
+# -------------------- RAID DETECTION --------------------
 @bot.event
 async def on_member_join(member):
     guild = member.guild
@@ -206,7 +208,9 @@ async def on_member_join(member):
         cfg["raid_mode"] = False
         await log_event(guild.id, discord.Embed(description="✅ Raid mode disabled", color=discord.Color.green()))
 
-@bot.tree.command(name="antinuke", description="Manage anti-nuke settings")
+# -------------------- SLASH COMMANDS --------------------
+# ----- Main antinuke command group -----
+@bot.tree.command(name="antinuke", description="View or change anti-nuke settings")
 @commands.has_permissions(administrator=True)
 async def antinuke(interaction: discord.Interaction, action: str = None, key: str = None, value: str = None):
     if action is None:
@@ -214,47 +218,146 @@ async def antinuke(interaction: discord.Interaction, action: str = None, key: st
         return
 
     cfg = get_config(interaction.guild_id)
+
     if action == "status":
         embed = discord.Embed(title="🛡️ Anti-Nuke Configuration", color=discord.Color.blurple())
         for k, v in cfg.items():
             if k not in ["whitelist_users", "whitelist_roles", "admin_roles"]:
                 embed.add_field(name=k, value=str(v), inline=False)
+        embed.set_footer(text="Use /antinuke set <key> <value> to change a setting")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
     elif action == "set" and key and value:
         if key in cfg:
+            # Convert value type
             if isinstance(cfg[key], bool):
-                value = value.lower() == "true"
+                val = value.lower() == "true"
             elif isinstance(cfg[key], int):
-                value = int(value)
-            cfg[key] = value
-            await interaction.response.send_message(f"✅ Set `{key}` to `{value}`", ephemeral=True)
+                try:
+                    val = int(value)
+                except:
+                    await interaction.response.send_message("❌ Value must be a number", ephemeral=True)
+                    return
+            else:
+                val = value
+            cfg[key] = val
+            await interaction.response.send_message(f"✅ Set `{key}` to `{val}`", ephemeral=True)
         else:
-            await interaction.response.send_message(f"❌ Unknown key: {key}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Unknown key: {key}\nValid keys: {', '.join(cfg.keys())}", ephemeral=True)
+
+    elif action == "enable":
+        cfg["enabled"] = True
+        await interaction.response.send_message("✅ Anti-nuke protection **enabled**", ephemeral=True)
+
+    elif action == "disable":
+        cfg["enabled"] = False
+        await interaction.response.send_message("⚠️ Anti-nuke protection **disabled**", ephemeral=True)
+
+    elif action == "set_punishment":
+        if not key:
+            await interaction.response.send_message("Usage: `/antinuke set_punishment ban|kick|strip_roles|alert`", ephemeral=True)
+            return
+        if key in ["ban", "kick", "strip_roles", "alert"]:
+            cfg["punishment"] = key
+            await interaction.response.send_message(f"✅ Punishment set to `{key}`", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Invalid punishment. Options: ban, kick, strip_roles, alert", ephemeral=True)
+
+    elif action == "set_logs":
+        if not key:
+            await interaction.response.send_message("Usage: `/antinuke set_logs #channel` or provide channel ID", ephemeral=True)
+            return
+        # key can be a channel mention or ID
+        channel = None
+        if key.isdigit():
+            channel = interaction.guild.get_channel(int(key))
+        else:
+            # try to parse mention
+            mention = key.strip('<#>')
+            if mention.isdigit():
+                channel = interaction.guild.get_channel(int(mention))
+        if channel:
+            cfg["log_channel_id"] = channel.id
+            await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Invalid channel. Please mention a channel or provide its ID.", ephemeral=True)
+
     else:
-        await interaction.response.send_message("Invalid subcommand.", ephemeral=True)
+        await interaction.response.send_message("Invalid subcommand. Use: status, set, enable, disable, set_punishment, set_logs", ephemeral=True)
 
-@bot.tree.command(name="antinuke_logs", description="Set the log channel")
-@commands.has_permissions(administrator=True)
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_config(interaction.guild_id)
-    cfg["log_channel_id"] = channel.id
-    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+# ----- Separate help command -----
+@bot.tree.command(name="help", description="Show all commands and what they do")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🛡️ Anti-Nuke Bot – Command List",
+        description="All commands use slash (`/`). You need `Administrator` permission to change settings.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
 
+    embed.add_field(
+        name="/antinuke status",
+        value="Shows current anti‑nuke settings (thresholds, punishment, etc.)",
+        inline=False
+    )
+    embed.add_field(
+        name="/antinuke set <key> <value>",
+        value="Change a setting. Example: `/antinuke set max_bans 5`\nKeys: `max_bans`, `max_kicks`, `max_channel_deletes`, `max_role_deletes`, `max_webhook_creates`, `time_window`, `punishment`, `restore_channels`, `restore_roles`, `purge_webhooks`, `raid_join_threshold`, `enabled`",
+        inline=False
+    )
+    embed.add_field(
+        name="/antinuke enable",
+        value="Turns anti‑nuke protection ON",
+        inline=False
+    )
+    embed.add_field(
+        name="/antinuke disable",
+        value="Turns anti‑nuke protection OFF (not recommended)",
+        inline=False
+    )
+    embed.add_field(
+        name="/antinuke set_punishment <type>",
+        value="Change punishment: `ban`, `kick`, `strip_roles`, `alert`",
+        inline=False
+    )
+    embed.add_field(
+        name="/antinuke set_logs #channel",
+        value="Set a channel for alert logs",
+        inline=False
+    )
+    embed.add_field(
+        name="/help",
+        value="Shows this message",
+        inline=False
+    )
+
+    embed.set_footer(text="Your server is protected 24/7 🛡️")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ----- Simple ping command -----
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🏓 Pong! Latency: {round(bot.latency * 1000)}ms")
+
+# -------------------- BACKGROUND TASKS --------------------
 @tasks.loop(minutes=5)
 async def cleanup_trackers():
     now = datetime.now(timezone.utc).timestamp()
     for guild_id, users in guild_action_trackers.items():
-        for user_id, deque_ in users.items():
+        for user_id, deque_ in list(users.items()):
             while deque_ and deque_[0][0] < now - 60:
                 deque_.popleft()
-        guild_action_trackers[guild_id] = {uid: dq for uid, dq in users.items() if dq}
+            if not deque_:
+                del guild_action_trackers[guild_id][user_id]
 
 @tasks.loop(minutes=1)
 async def raid_auto_disable():
     for guild_id, tracker in guild_join_tracker.items():
         cfg = get_config(guild_id)
-        if cfg["raid_mode"] and len(tracker) == 0:
+        if cfg.get("raid_mode", False) and len(tracker) == 0:
             cfg["raid_mode"] = False
+            # Optionally send log
+            await log_event(guild_id, discord.Embed(description="✅ Raid mode auto-disabled", color=discord.Color.green()))
 
 @bot.event
 async def on_ready():
@@ -262,6 +365,8 @@ async def on_ready():
     cleanup_trackers.start()
     raid_auto_disable.start()
     print(f"✅ Anti-nuke bot online as {bot.user}")
+    print("Commands synced globally (may take a few minutes to appear)")
 
+# -------------------- RUN --------------------
 if __name__ == "__main__":
     bot.run(TOKEN)
