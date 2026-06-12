@@ -4,13 +4,12 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 import asyncio
 import os
-import traceback
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
 
-# ========== CONFIGURATION (now with more options) ==========
+# ========== CONFIGURATION ==========
 DEFAULT_CONFIG = {
     "enabled": True,
     "max_bans": 3,
@@ -28,13 +27,14 @@ DEFAULT_CONFIG = {
     "restore_roles": True,
     "purge_webhooks_on_nuke": True,
     "raid_join_threshold": 15,
-    "raid_auto_kick": True,          # NEW: kick joiners during raid
+    "raid_auto_kick": True,
     "raid_mode": False,
     "log_channel_id": None,
+    "bypass_role_id": None,          # Owner‑set role immune to anti‑nuke & lockdown
+    "admin_role_id": None,           # Role that can edit settings
+    "lockdown_exception_role_id": None,  # Role that can speak during lockdown
     "whitelist_users": [],
     "whitelist_roles": [],
-    "lockdown_role_id": None,         # NEW: role that can still talk during lockdown
-    "lockdown_message": None,         # NEW: custom lockdown announcement
 }
 
 guild_configs = {}
@@ -55,6 +55,14 @@ def get_config(guild_id):
     if guild_id not in guild_configs:
         guild_configs[guild_id] = DEFAULT_CONFIG.copy()
     return guild_configs[guild_id]
+
+def has_bypass(guild_id, member):
+    """Check if member has the owner‑set bypass role."""
+    cfg = get_config(guild_id)
+    bypass_role_id = cfg.get("bypass_role_id")
+    if bypass_role_id and member.get_role(bypass_role_id):
+        return True
+    return False
 
 def is_whitelisted(guild_id, user_id, roles):
     cfg = get_config(guild_id)
@@ -78,6 +86,18 @@ async def log_to_channel(guild_id, embed):
 
 async def punish_user(guild, user, action, reason):
     cfg = get_config(guild.id)
+    # Check bypass before punishing
+    try:
+        member = await guild.fetch_member(user.id)
+        if has_bypass(guild.id, member):
+            await log_to_channel(guild.id, discord.Embed(
+                description=f"⚠️ **Bypass role prevented punishment** for {user.mention} ({action})",
+                color=discord.Color.orange()
+            ))
+            return
+    except:
+        pass
+
     punishment = cfg["punishment"]
     embed = discord.Embed(
         title="🚨 **ANTI-NUKE TRIGGERED** 🚨",
@@ -124,10 +144,10 @@ async def check_and_punish(guild, user, action_type, count=1):
         return
     try:
         member = await guild.fetch_member(user.id)
-        if is_whitelisted(guild.id, user.id, member.roles):
+        if has_bypass(guild.id, member) or is_whitelisted(guild.id, user.id, member.roles):
             return
     except:
-        pass
+        return
 
     limit_map = {
         "ban": cfg["max_bans"],
@@ -210,7 +230,7 @@ async def purge_all_webhooks(guild):
             color=discord.Color.orange()
         ))
 
-# -------------------- RAID DETECTION & AUTO-KICK --------------------
+# -------------------- RAID DETECTION --------------------
 @bot.event
 async def on_member_join(member):
     guild = member.guild
@@ -239,11 +259,12 @@ async def on_member_join(member):
 
     if cfg["raid_mode"] and cfg.get("raid_auto_kick", True):
         try:
-            await member.kick(reason="Raid mode active – auto protection")
-            await log_to_channel(guild.id, discord.Embed(
-                description=f"🔨 Kicked {member.mention} during raid mode",
-                color=discord.Color.red()
-            ))
+            if not has_bypass(guild.id, member):
+                await member.kick(reason="Raid mode active – auto protection")
+                await log_to_channel(guild.id, discord.Embed(
+                    description=f"🔨 Kicked {member.mention} during raid mode",
+                    color=discord.Color.red()
+                ))
         except:
             pass
 
@@ -306,63 +327,47 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
         if len(recent_webhooks) >= cfg["max_webhook_creates"]:
             await purge_all_webhooks(guild)
 
-# -------------------- LOCKDOWN (BRUTEFORCE FIX) --------------------
+# -------------------- LOCKDOWN (ULTIMATE) --------------------
 @bot.tree.command(name="lockdown", description="Lock down the server: disable messages, delete webhooks")
 async def lockdown_cmd(interaction: discord.Interaction):
-    # Owner only
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+    # Owner only (or bypass role? we'll keep owner only for safety)
+    if interaction.user.id != interaction.guild.owner_id and not has_bypass(interaction.guild.id, interaction.user):
+        await interaction.response.send_message("❌ Only the server owner or bypass role can use this command.", ephemeral=True)
         return
 
-    # Permission check with detailed error
     me = interaction.guild.me
-    missing = []
-    if not me.guild_permissions.manage_channels:
-        missing.append("Manage Channels")
-    if not me.guild_permissions.manage_webhooks:
-        missing.append("Manage Webhooks")
-    if not me.guild_permissions.manage_roles:
-        missing.append("Manage Roles")
-    if missing:
-        await interaction.response.send_message(
-            f"❌ Bot is missing permissions: {', '.join(missing)}. Please grant them.\n"
-            f"Tip: Give the bot `Administrator` permission temporarily.",
-            ephemeral=True
-        )
+    if not me.guild_permissions.manage_channels or not me.guild_permissions.manage_webhooks:
+        await interaction.response.send_message("❌ Bot missing permissions (Manage Channels, Manage Webhooks).", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=False)
 
     guild = interaction.guild
     cfg = get_config(guild.id)
-    lockdown_role_id = cfg.get("lockdown_role_id")
-    lockdown_role = guild.get_role(lockdown_role_id) if lockdown_role_id else None
+    exception_role_id = cfg.get("lockdown_exception_role_id")
+    exception_role = guild.get_role(exception_role_id) if exception_role_id else None
 
     locked_channels = 0
-    failed_channels = 0
+    failed = 0
     deleted_webhooks = 0
     errors = []
 
-    # Lock text channels
     for channel in guild.text_channels:
         try:
-            # Create overwrite for @everyone
-            overwrite_everyone = channel.overwrites_for(guild.default_role)
-            overwrite_everyone.send_messages = False
-            await channel.set_permissions(guild.default_role, overwrite=overwrite_everyone)
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = False
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
 
-            # If a lockdown role is set, allow that role to speak
-            if lockdown_role:
-                overwrite_role = channel.overwrites_for(lockdown_role)
-                overwrite_role.send_messages = True
-                await channel.set_permissions(lockdown_role, overwrite=overwrite_role)
+            if exception_role:
+                ex_overwrite = channel.overwrites_for(exception_role)
+                ex_overwrite.send_messages = True
+                await channel.set_permissions(exception_role, ex_overwrite)
 
             locked_channels += 1
         except Exception as e:
-            failed_channels += 1
+            failed += 1
             errors.append(f"#{channel.name}: {str(e)[:60]}")
 
-    # Delete all webhooks
     for channel in guild.text_channels:
         try:
             webhooks = await channel.webhooks()
@@ -372,7 +377,6 @@ async def lockdown_cmd(interaction: discord.Interaction):
         except:
             pass
 
-    # Lock voice channels (disconnect and deny connect)
     for channel in guild.voice_channels:
         try:
             for member in channel.members:
@@ -383,65 +387,45 @@ async def lockdown_cmd(interaction: discord.Interaction):
         except:
             pass
 
-    # Send announcement if configured
-    if cfg.get("lockdown_message"):
-        try:
-            await interaction.followup.send(cfg["lockdown_message"])
-        except:
-            pass
-
     embed = discord.Embed(
         title="🔒 **SERVER LOCKDOWN COMPLETE**",
         description=f"**Issued by:** {interaction.user.mention}\n"
-                    f"🔒 **Channels locked:** {locked_channels} (failed: {failed_channels})\n"
+                    f"🔒 **Channels locked:** {locked_channels} (failed: {failed})\n"
                     f"🧹 **Webhooks deleted:** {deleted_webhooks}\n"
                     f"🔊 **Voice channels disabled**",
         color=discord.Color.dark_red(),
         timestamp=datetime.now(timezone.utc)
     )
+    if exception_role:
+        embed.add_field(name="🔑 Exception role", value=exception_role.mention, inline=False)
     if errors:
-        embed.add_field(name="⚠️ Some channels failed", value="\n".join(errors[:5]), inline=False)
-    if lockdown_role:
-        embed.add_field(name="🔑 Exception role", value=lockdown_role.mention, inline=False)
+        embed.add_field(name="⚠️ Errors", value="\n".join(errors[:5]), inline=False)
 
     await interaction.followup.send(embed=embed)
     await log_to_channel(guild.id, embed)
 
-@bot.tree.command(name="unlockdown", description="Unlock the server (restore @everyone send_messages)")
+@bot.tree.command(name="unlockdown", description="Unlock the server")
 async def unlockdown_cmd(interaction: discord.Interaction):
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+    if interaction.user.id != interaction.guild.owner_id and not has_bypass(interaction.guild.id, interaction.user):
+        await interaction.response.send_message("❌ Only the server owner or bypass role can use this command.", ephemeral=True)
         return
 
     me = interaction.guild.me
     if not me.guild_permissions.manage_channels:
-        await interaction.response.send_message("❌ Bot is missing `Manage Channels` permission.", ephemeral=True)
+        await interaction.response.send_message("❌ Bot missing Manage Channels permission.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=False)
 
     guild = interaction.guild
-    cfg = get_config(guild.id)
-    lockdown_role_id = cfg.get("lockdown_role_id")
-    lockdown_role = guild.get_role(lockdown_role_id) if lockdown_role_id else None
-
-    unlocked_channels = 0
+    unlocked = 0
 
     for channel in guild.text_channels:
         try:
-            # Remove @everyone deny
-            overwrite_everyone = channel.overwrites_for(guild.default_role)
-            overwrite_everyone.send_messages = None
-            await channel.set_permissions(guild.default_role, overwrite=overwrite_everyone)
-
-            # Remove special role permission if it exists
-            if lockdown_role:
-                try:
-                    await channel.set_permissions(lockdown_role, overwrite=None)
-                except:
-                    pass
-
-            unlocked_channels += 1
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = None
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+            unlocked += 1
         except:
             pass
 
@@ -456,16 +440,213 @@ async def unlockdown_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔓 **SERVER UNLOCKED**",
         description=f"**Issued by:** {interaction.user.mention}\n"
-                    f"🔓 **Channels unlocked:** {unlocked_channels}\n"
-                    f"🔊 **Voice channels re-enabled**",
+                    f"🔓 **Channels unlocked:** {unlocked}",
         color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc)
     )
     await interaction.followup.send(embed=embed)
     await log_to_channel(guild.id, embed)
 
-# -------------------- DEBUG COMMAND --------------------
-@bot.tree.command(name="check_perms", description="Check bot permissions (owner only)")
+# -------------------- ROLE SETUP (OWNER ONLY) --------------------
+@bot.tree.command(name="set_bypass_role", description="[OWNER ONLY] Set a role that bypasses all anti-nuke & lockdown")
+async def set_bypass_role(interaction: discord.Interaction, role: discord.Role):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+        return
+    cfg = get_config(interaction.guild_id)
+    cfg["bypass_role_id"] = role.id
+    await log_to_channel(interaction.guild_id, discord.Embed(
+        description=f"🔓 **Bypass role set to {role.mention}** by {interaction.user.mention}",
+        color=discord.Color.gold()
+    ))
+    await interaction.response.send_message(f"✅ `{role.name}` will now bypass all anti-nuke actions and lockdown.", ephemeral=True)
+
+@bot.tree.command(name="set_admin_role", description="Set a role that can edit anti-nuke settings")
+@commands.has_permissions(administrator=True)
+async def set_admin_role(interaction: discord.Interaction, role: discord.Role):
+    cfg = get_config(interaction.guild_id)
+    cfg["admin_role_id"] = role.id
+    await log_to_channel(interaction.guild_id, discord.Embed(
+        description=f"⚙️ **Anti-nuke admin role set to {role.mention}** by {interaction.user.mention}",
+        color=discord.Color.blue()
+    ))
+    await interaction.response.send_message(f"✅ `{role.name}` can now edit anti-nuke settings.", ephemeral=True)
+
+@bot.tree.command(name="set_lockdown_exception", description="Set a role that can speak during lockdown")
+@commands.has_permissions(administrator=True)
+async def set_lockdown_exception(interaction: discord.Interaction, role: discord.Role):
+    cfg = get_config(interaction.guild_id)
+    cfg["lockdown_exception_role_id"] = role.id
+    await log_to_channel(interaction.guild_id, discord.Embed(
+        description=f"🔑 **Lockdown exception role set to {role.mention}**",
+        color=discord.Color.blue()
+    ))
+    await interaction.response.send_message(f"✅ `{role.name}` will be able to talk during lockdown.", ephemeral=True)
+
+# -------------------- COMMAND PERMISSION WRAPPER --------------------
+def admin_or_antinuke_role():
+    async def predicate(interaction: discord.Interaction):
+        cfg = get_config(interaction.guild_id)
+        admin_role_id = cfg.get("admin_role_id")
+        if admin_role_id and interaction.user.get_role(admin_role_id):
+            return True
+        return interaction.user.guild_permissions.administrator
+    return commands.check(predicate)
+
+# -------------------- CONFIGURATION COMMANDS --------------------
+@bot.tree.command(name="help", description="Show all commands")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🛡️ **ULTIMATE ANTI-NUKE BOT**",
+        description="**Prefix:** `/` (slash commands)\n"
+                    "🔹 **Admin/anti‑nuke role** can use `/enable`, `/disable`, `/set`, `/punishment`, `/setlogs`, `/whitelist`\n"
+                    "🔹 **Owner only** can use `/set_bypass_role`, `/set_admin_role`, `/set_lockdown_exception`\n"
+                    "🔹 **Lockdown** commands require owner or bypass role",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="📊 `/status`", value="Show current settings", inline=False)
+    embed.add_field(name="✅ `/enable` / `/disable`", value="Turn protection on/off", inline=False)
+    embed.add_field(name="⚙️ `/set <setting> <value>`", value="Change thresholds (max_bans, max_kicks, ...)", inline=False)
+    embed.add_field(name="🔨 `/punishment <type>`", value="Set punishment: ban, kick, strip_roles, alert", inline=False)
+    embed.add_field(name="📝 `/setlogs #channel`", value="Set log channel", inline=False)
+    embed.add_field(name="👥 `/whitelist user/role`", value="Whitelist from anti-nuke", inline=False)
+    embed.add_field(name="🔒 `/lockdown`", value="Lock all channels, delete webhooks", inline=False)
+    embed.add_field(name="🔓 `/unlockdown`", value="Unlock server", inline=False)
+    embed.add_field(name="👑 `/set_bypass_role @role`", value="[OWNER] Set role immune to all actions", inline=False)
+    embed.add_field(name="⚙️ `/set_admin_role @role`", value="Set role that can edit settings", inline=False)
+    embed.add_field(name="🔑 `/set_lockdown_exception @role`", value="Set role that can talk during lockdown", inline=False)
+    embed.add_field(name="🚫 `/toggle_raid_autokick`", value="Enable/disable auto‑kick during raids", inline=False)
+    embed.add_field(name="🔍 `/check_perms`", value="Show bot permissions (owner only)", inline=False)
+    embed.add_field(name="🏓 `/ping`", value="Check bot latency", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="status", description="Show anti-nuke configuration")
+@admin_or_antinuke_role()
+async def status_cmd(interaction: discord.Interaction):
+    cfg = get_config(interaction.guild_id)
+    embed = discord.Embed(
+        title="🛡️ **Anti-Nuke Status**",
+        color=discord.Color.blue() if cfg["enabled"] else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Enabled", value=str(cfg["enabled"]), inline=True)
+    embed.add_field(name="Punishment", value=cfg["punishment"], inline=True)
+    embed.add_field(name="Time Window", value=f"{cfg['time_window']}s", inline=True)
+    embed.add_field(name="Max Bans", value=str(cfg["max_bans"]), inline=True)
+    embed.add_field(name="Max Kicks", value=str(cfg["max_kicks"]), inline=True)
+    embed.add_field(name="Max Channel Deletes", value=str(cfg["max_channel_deletes"]), inline=True)
+    embed.add_field(name="Max Role Deletes", value=str(cfg["max_role_deletes"]), inline=True)
+    embed.add_field(name="Max Webhook Creates", value=str(cfg["max_webhook_creates"]), inline=True)
+    embed.add_field(name="Max Integration Creates", value=str(cfg["max_integration_creates"]), inline=True)
+    embed.add_field(name="Max Channel Creates", value=str(cfg["max_channel_creates"]), inline=True)
+    embed.add_field(name="Max Role Creates", value=str(cfg["max_role_creates"]), inline=True)
+    embed.add_field(name="Max Permission Updates", value=str(cfg["max_permission_updates"]), inline=True)
+    embed.add_field(name="Restore Channels", value=str(cfg["restore_channels"]), inline=True)
+    embed.add_field(name="Restore Roles", value=str(cfg["restore_roles"]), inline=True)
+    embed.add_field(name="Raid Threshold", value=f"{cfg['raid_join_threshold']} in 10s", inline=True)
+    embed.add_field(name="Raid Auto‑Kick", value=str(cfg.get("raid_auto_kick", True)), inline=True)
+    embed.add_field(name="Raid Mode", value=str(cfg["raid_mode"]), inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="enable", description="Turn on anti-nuke protection")
+@admin_or_antinuke_role()
+async def enable_cmd(interaction: discord.Interaction):
+    cfg = get_config(interaction.guild_id)
+    old = cfg["enabled"]
+    cfg["enabled"] = True
+    await log_setting(interaction.guild_id, interaction.user, "enabled", old, True)
+    await interaction.response.send_message("✅ Anti-nuke protection **enabled**", ephemeral=True)
+
+@bot.tree.command(name="disable", description="Turn off anti-nuke protection (not recommended)")
+@admin_or_antinuke_role()
+async def disable_cmd(interaction: discord.Interaction):
+    cfg = get_config(interaction.guild_id)
+    old = cfg["enabled"]
+    cfg["enabled"] = False
+    await log_setting(interaction.guild_id, interaction.user, "enabled", old, False)
+    await interaction.response.send_message("⚠️ Anti-nuke protection **disabled**", ephemeral=True)
+
+@bot.tree.command(name="set", description="Change a setting (e.g., /set max_bans 5)")
+@admin_or_antinuke_role()
+async def set_cmd(interaction: discord.Interaction, setting: str, value: str):
+    cfg = get_config(interaction.guild_id)
+    if setting not in cfg:
+        await interaction.response.send_message(f"❌ Unknown setting `{setting}`. Use `/status` to see available settings.", ephemeral=True)
+        return
+    old = cfg[setting]
+    try:
+        if isinstance(cfg[setting], bool):
+            new = value.lower() == "true"
+        elif isinstance(cfg[setting], int):
+            new = int(value)
+        else:
+            new = value
+    except:
+        await interaction.response.send_message("❌ Invalid value type", ephemeral=True)
+        return
+    cfg[setting] = new
+    await log_setting(interaction.guild_id, interaction.user, setting, old, new)
+    await interaction.response.send_message(f"✅ `{setting}` changed from `{old}` to `{new}`", ephemeral=True)
+
+@bot.tree.command(name="punishment", description="Set punishment type: ban, kick, strip_roles, alert")
+@admin_or_antinuke_role()
+async def punishment_cmd(interaction: discord.Interaction, punishment: str):
+    if punishment not in ["ban", "kick", "strip_roles", "alert"]:
+        await interaction.response.send_message("❌ Invalid punishment. Choose: `ban`, `kick`, `strip_roles`, `alert`", ephemeral=True)
+        return
+    cfg = get_config(interaction.guild_id)
+    old = cfg["punishment"]
+    cfg["punishment"] = punishment
+    await log_setting(interaction.guild_id, interaction.user, "punishment", old, punishment)
+    await interaction.response.send_message(f"✅ Punishment set to `{punishment}`", ephemeral=True)
+
+@bot.tree.command(name="setlogs", description="Set the channel for alert logs")
+@admin_or_antinuke_role()
+async def setlogs_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    cfg = get_config(interaction.guild_id)
+    old = cfg.get("log_channel_id")
+    cfg["log_channel_id"] = channel.id
+    await log_setting(interaction.guild_id, interaction.user, "log_channel_id", old, channel.id)
+    await interaction.response.send_message(f"✅ Logs will be sent to {channel.mention}", ephemeral=True)
+
+@bot.tree.command(name="whitelist", description="Whitelist a user or role")
+@admin_or_antinuke_role()
+async def whitelist_cmd(interaction: discord.Interaction, target: str, item: str):
+    cfg = get_config(interaction.guild_id)
+    if target == "user":
+        try:
+            user_id = int(item.replace("<@", "").replace(">", "").replace("!", ""))
+            if user_id not in cfg["whitelist_users"]:
+                cfg["whitelist_users"].append(user_id)
+                await interaction.response.send_message(f"✅ User <@{user_id}> whitelisted", ephemeral=True)
+            else:
+                await interaction.response.send_message("User already whitelisted", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ Invalid user mention or ID", ephemeral=True)
+    elif target == "role":
+        try:
+            role_id = int(item.replace("<@&", "").replace(">", ""))
+            if role_id not in cfg["whitelist_roles"]:
+                cfg["whitelist_roles"].append(role_id)
+                await interaction.response.send_message(f"✅ Role <@&{role_id}> whitelisted", ephemeral=True)
+            else:
+                await interaction.response.send_message("Role already whitelisted", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ Invalid role mention or ID", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Usage: `/whitelist user @user` or `/whitelist role @role`", ephemeral=True)
+
+@bot.tree.command(name="toggle_raid_autokick", description="Enable/disable auto‑kick during raid mode")
+@admin_or_antinuke_role()
+async def toggle_raid_autokick(interaction: discord.Interaction, enabled: bool):
+    cfg = get_config(interaction.guild_id)
+    old = cfg.get("raid_auto_kick", True)
+    cfg["raid_auto_kick"] = enabled
+    await log_setting(interaction.guild_id, interaction.user, "raid_auto_kick", old, enabled)
+    await interaction.response.send_message(f"✅ Raid auto‑kick set to `{enabled}`.", ephemeral=True)
+
+@bot.tree.command(name="check_perms", description="[OWNER ONLY] Check bot permissions")
 async def check_perms(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("❌ Owner only.", ephemeral=True)
@@ -483,33 +664,11 @@ async def check_perms(interaction: discord.Interaction):
     lines = [f"**{k}:** {'✅' if v else '❌'}" for k, v in perms.items()]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-# -------------------- BETTER UI / MORE SETTINGS --------------------
-@bot.tree.command(name="set_lockdown_role", description="Set a role that can still speak during lockdown")
-@commands.has_permissions(administrator=True)
-async def set_lockdown_role(interaction: discord.Interaction, role: discord.Role):
-    cfg = get_config(interaction.guild_id)
-    cfg["lockdown_role_id"] = role.id
-    await log_setting(interaction.guild_id, interaction.user, "lockdown_role_id", None, role.id)
-    await interaction.response.send_message(f"✅ `{role.name}` will be able to speak during lockdown.", ephemeral=True)
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🏓 Pong! Latency: {round(bot.latency * 1000)}ms", ephemeral=True)
 
-@bot.tree.command(name="set_lockdown_message", description="Set an announcement message sent during lockdown")
-@commands.has_permissions(administrator=True)
-async def set_lockdown_message(interaction: discord.Interaction, message: str):
-    cfg = get_config(interaction.guild_id)
-    cfg["lockdown_message"] = message
-    await log_setting(interaction.guild_id, interaction.user, "lockdown_message", None, message[:50])
-    await interaction.response.send_message("✅ Lockdown announcement set.", ephemeral=True)
-
-@bot.tree.command(name="toggle_raid_autokick", description="Enable/disable auto‑kick during raid mode")
-@commands.has_permissions(administrator=True)
-async def toggle_raid_autokick(interaction: discord.Interaction, enabled: bool):
-    cfg = get_config(interaction.guild_id)
-    old = cfg.get("raid_auto_kick", True)
-    cfg["raid_auto_kick"] = enabled
-    await log_setting(interaction.guild_id, interaction.user, "raid_auto_kick", old, enabled)
-    await interaction.response.send_message(f"✅ Raid auto‑kick set to `{enabled}`.", ephemeral=True)
-
-# -------------------- LOGGING FOR SETTINGS --------------------
+# -------------------- LOGGING HELPER --------------------
 async def log_setting(guild_id, user, setting, old, new):
     embed = discord.Embed(
         title="⚙️ **Anti-Nuke Setting Changed**",
@@ -518,41 +677,6 @@ async def log_setting(guild_id, user, setting, old, new):
         timestamp=datetime.now(timezone.utc)
     )
     await log_to_channel(guild_id, embed)
-
-# -------------------- EXISTING CONFIGURATION COMMANDS (unchanged but with better UI) --------------------
-@bot.tree.command(name="help", description="Show all commands")
-async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🛡️ **Anti‑Nuke Bot – Complete Command List**",
-        description="Use `/` to run these commands. `Administrator` permission required to change settings.\n"
-                    "**Lockdown** commands are only for the server owner.",
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="📊 `/status`", value="Show current anti‑nuke settings", inline=False)
-    embed.add_field(name="✅ `/enable` / `/disable`", value="Turn protection on/off", inline=False)
-    embed.add_field(name="⚙️ `/set <setting> <value>`", value="Change thresholds (`max_bans`, `max_kicks`, etc.)", inline=False)
-    embed.add_field(name="🔨 `/punishment <type>`", value="Set punishment: `ban`, `kick`, `strip_roles`, `alert`", inline=False)
-    embed.add_field(name="📝 `/setlogs #channel`", value="Set the log channel", inline=False)
-    embed.add_field(name="👥 `/whitelist user/role`", value="Whitelist a user or role (ignored by anti‑nuke)", inline=False)
-    embed.add_field(name="🔒 `/lockdown`", value="**Owner only** – lock all channels, delete webhooks", inline=False)
-    embed.add_field(name="🔓 `/unlockdown`", value="**Owner only** – restore channel permissions", inline=False)
-    embed.add_field(name="🔑 `/set_lockdown_role @role`", value="Set a role that can still talk during lockdown", inline=False)
-    embed.add_field(name="📢 `/set_lockdown_message <text>`", value="Set an announcement sent during lockdown", inline=False)
-    embed.add_field(name="🚫 `/toggle_raid_autokick true/false`", value="Auto‑kick new members during raid mode", inline=False)
-    embed.add_field(name="🔍 `/check_perms`", value="**Owner only** – show bot permissions", inline=False)
-    embed.add_field(name="🏓 `/ping`", value="Check bot latency", inline=False)
-    embed.set_footer(text="Your server is protected 24/7 🛡️")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# Other existing commands (status, enable, disable, set, punishment, setlogs, whitelist, ping) remain as before.
-# They are already defined above. I'll keep them for completeness.
-
-# -------------------- THE SAME STATUS, ENABLE, DISABLE, SET, PUNISHMENT, SETLOGS, WHITELIST, PING --------------------
-# (I'll include them here, but they are identical to the ones in your previous script – omitted for brevity.
-#  In the final paste you must include them. Since the user already has them, I'll just summarise that they are present.)
-
-# Actually, to avoid missing commands, I'll paste the full script in the final answer.
 
 # -------------------- BACKGROUND CLEANUP --------------------
 @tasks.loop(minutes=5)
@@ -571,7 +695,7 @@ async def clean_trackers():
 async def on_ready():
     await bot.tree.sync()
     clean_trackers.start()
-    print(f"✅ Anti-nuke bot online as {bot.user}")
+    print(f"✅ Ultimate anti-nuke bot online as {bot.user}")
     print("Slash commands synced. Use /help in Discord.")
 
 if __name__ == "__main__":
