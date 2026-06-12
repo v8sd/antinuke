@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 import asyncio
 import os
+import traceback
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
@@ -67,7 +68,10 @@ async def log_to_channel(guild_id, embed):
     if ch_id:
         channel = bot.get_channel(ch_id)
         if channel:
-            await channel.send(embed=embed)
+            try:
+                await channel.send(embed=embed)
+            except:
+                pass
 
 async def punish_user(guild, user, action, reason):
     cfg = get_config(guild.id)
@@ -230,7 +234,6 @@ async def on_member_join(member):
             color=discord.Color.green()
         ))
 
-    # If raid mode is active, kick the new member
     if cfg["raid_mode"]:
         try:
             await member.kick(reason="Raid mode active – auto protection")
@@ -300,7 +303,7 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
         if len(recent_webhooks) >= cfg["max_webhook_creates"]:
             await purge_all_webhooks(guild)
 
-# -------------------- LOCKDOWN / UNLOCKDOWN (FIXED) --------------------
+# -------------------- LOCKDOWN (FULLY FIXED) --------------------
 @bot.tree.command(name="lockdown", description="Lock down the server: disable messages, delete webhooks")
 async def lockdown_cmd(interaction: discord.Interaction):
     # Owner only
@@ -316,7 +319,7 @@ async def lockdown_cmd(interaction: discord.Interaction):
     if not me.guild_permissions.manage_webhooks:
         missing.append("Manage Webhooks")
     if missing:
-        await interaction.response.send_message(f"❌ Bot is missing permissions: {', '.join(missing)}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Bot is missing permissions: {', '.join(missing)}. Please grant them.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=False)
@@ -330,14 +333,13 @@ async def lockdown_cmd(interaction: discord.Interaction):
     # 1. Lock text channels
     for channel in guild.text_channels:
         try:
-            # Get current overwrite for @everyone
             overwrite = channel.overwrites_for(guild.default_role)
             overwrite.send_messages = False
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
             locked_channels += 1
         except Exception as e:
             failed_channels += 1
-            errors.append(f"#{channel.name}: {str(e)[:50]}")
+            errors.append(f"#{channel.name}: {str(e)[:60]}")
 
     # 2. Delete all webhooks
     for channel in guild.text_channels:
@@ -349,13 +351,11 @@ async def lockdown_cmd(interaction: discord.Interaction):
         except:
             pass
 
-    # 3. Disconnect all voice users and deny connect
+    # 3. Disconnect voice users and deny connect
     for channel in guild.voice_channels:
         try:
-            # Disconnect members
             for member in channel.members:
                 await member.move_to(None)
-            # Deny connect for @everyone
             overwrite = channel.overwrites_for(guild.default_role)
             overwrite.connect = False
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
@@ -396,14 +396,12 @@ async def unlockdown_cmd(interaction: discord.Interaction):
     for channel in guild.text_channels:
         try:
             overwrite = channel.overwrites_for(guild.default_role)
-            # Remove the explicit deny; revert to default (usually allowed via @everyone)
-            overwrite.send_messages = None
+            overwrite.send_messages = None  # Remove explicit deny
             await channel.set_permissions(guild.default_role, overwrite=overwrite)
             unlocked_channels += 1
         except:
             pass
 
-    # Re-enable voice connect
     for channel in guild.voice_channels:
         try:
             overwrite = channel.overwrites_for(guild.default_role)
@@ -423,7 +421,25 @@ async def unlockdown_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
     await log_to_channel(guild.id, embed)
 
-# -------------------- SLASH COMMANDS (CONFIGURATION) --------------------
+# -------------------- DEBUG COMMAND (to check permissions) --------------------
+@bot.tree.command(name="check_perms", description="Check bot permissions (owner only)")
+async def check_perms(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+        return
+    me = interaction.guild.me
+    perms = {
+        "Manage Channels": me.guild_permissions.manage_channels,
+        "Manage Webhooks": me.guild_permissions.manage_webhooks,
+        "View Audit Log": me.guild_permissions.view_audit_log,
+        "Ban Members": me.guild_permissions.ban_members,
+        "Kick Members": me.guild_permissions.kick_members,
+        "Send Messages": me.guild_permissions.send_messages,
+    }
+    lines = [f"**{k}:** {'✅' if v else '❌'}" for k, v in perms.items()]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+# -------------------- CONFIGURATION COMMANDS --------------------
 async def log_setting(guild_id, user, setting, old, new):
     embed = discord.Embed(
         title="⚙️ **Anti-Nuke Setting Changed**",
@@ -450,6 +466,7 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="`/whitelist user/role`", value="Whitelist a user or role (ignored by anti-nuke)", inline=False)
     embed.add_field(name="`/lockdown`", value="**Owner only** – lock all channels, delete webhooks", inline=False)
     embed.add_field(name="`/unlockdown`", value="**Owner only** – restore channel permissions", inline=False)
+    embed.add_field(name="`/check_perms`", value="**Owner only** – show bot permissions", inline=False)
     embed.add_field(name="`/ping`", value="Check bot latency", inline=False)
     embed.set_footer(text="Your server is protected 24/7 🛡️")
     await interaction.response.send_message(embed=embed, ephemeral=True)
