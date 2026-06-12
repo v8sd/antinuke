@@ -18,9 +18,9 @@ DEFAULT_CONFIG = {
     "max_role_deletes": 4,
     "max_webhook_creates": 3,
     "max_integration_create": 2,      # Authorized apps (OAuth2)
-    "max_channel_creates": 5,         # Mass channel creation
-    "max_role_creates": 5,            # Mass role creation
-    "max_permission_updates": 3,      # Suspicious permission changes
+    "max_channel_creates": 5,
+    "max_role_creates": 5,
+    "max_permission_updates": 3,
     "time_window": 10,
     "punishment": "ban",
     "restore_channels": True,
@@ -145,57 +145,40 @@ async def check_action(guild, user, action_type, extra_count=1):
         guild_action_trackers[guild.id][user.id].clear()
 
 async def restore_channel(guild, entry):
-    """Restore a deleted channel with its original name and settings."""
     try:
-        # The audit log entry contains the channel name, category, and permission overwrites
         name = getattr(entry.extra, 'name', 'restored-channel')
         category_id = getattr(entry.extra, 'category_id', None)
         overwrites = getattr(entry.extra, 'overwrites', {})
-        
-        # Create the new channel
         new_channel = await guild.create_text_channel(
             name=name,
             category=guild.get_channel(category_id) if category_id else None,
             overwrites=overwrites
         )
         await log_event(guild.id, discord.Embed(
-            description=f"🔄 Restored channel `{new_channel.name}` (original name preserved)",
+            description=f"🔄 Restored channel `{new_channel.name}`",
             color=discord.Color.green()
         ))
     except Exception as e:
-        await log_event(guild.id, discord.Embed(
-            description=f"❌ Failed to restore channel: {e}",
-            color=discord.Color.red()
-        ))
+        await log_event(guild.id, discord.Embed(description=f"❌ Failed to restore channel: {e}", color=discord.Color.red()))
 
 async def restore_role(guild, entry):
-    """Restore a deleted role with its original name and permissions."""
     try:
         name = getattr(entry.extra, 'name', 'restored-role')
         permissions = getattr(entry.extra, 'permissions', discord.Permissions.none())
         colour = getattr(entry.extra, 'colour', discord.Color.default())
         hoist = getattr(entry.extra, 'hoist', False)
         mentionable = getattr(entry.extra, 'mentionable', False)
-        
         new_role = await guild.create_role(
-            name=name,
-            permissions=permissions,
-            colour=colour,
-            hoist=hoist,
-            mentionable=mentionable
+            name=name, permissions=permissions, colour=colour, hoist=hoist, mentionable=mentionable
         )
         await log_event(guild.id, discord.Embed(
-            description=f"🔄 Restored role `{new_role.name}` (original name preserved)",
+            description=f"🔄 Restored role `{new_role.name}`",
             color=discord.Color.green()
         ))
     except Exception as e:
-        await log_event(guild.id, discord.Embed(
-            description=f"❌ Failed to restore role: {e}",
-            color=discord.Color.red()
-        ))
+        await log_event(guild.id, discord.Embed(description=f"❌ Failed to restore role: {e}", color=discord.Color.red()))
 
 async def purge_all_webhooks(guild):
-    """Delete all webhooks in the server (used when webhook spam detected)."""
     count = 0
     for channel in guild.text_channels:
         webhooks = await channel.webhooks()
@@ -205,11 +188,8 @@ async def purge_all_webhooks(guild):
                 count += 1
             except:
                 pass
-    if count > 0:
-        await log_event(guild.id, discord.Embed(
-            description=f"🧹 Purged {count} webhooks",
-            color=discord.Color.orange()
-        ))
+    if count:
+        await log_event(guild.id, discord.Embed(description=f"🧹 Purged {count} webhooks", color=discord.Color.orange()))
 
 # -------------------- AUDIT LOG LISTENER --------------------
 @bot.event
@@ -221,7 +201,7 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
 
     cfg = get_config(guild.id)
 
-    # ---- Detect nuke actions (destructive) ----
+    # ---- Detection & Punishment ----
     action_map = {
         discord.AuditLogAction.ban: ("ban", 1),
         discord.AuditLogAction.kick: ("kick", 1),
@@ -238,21 +218,21 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
     if entry.action in action_map:
         action_type, weight = action_map[entry.action]
         await check_action(guild, user, action_type, weight)
+        # If it's an integration creation, also send an informative alert (even if under threshold)
+        if entry.action == discord.AuditLogAction.integration_create:
+            embed = discord.Embed(
+                title="🔌 **Integration (Authorized App) Created**",
+                description=f"**User:** {user.mention}\n**Integration Name:** {entry.target.name if entry.target else 'Unknown'}",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            await log_event(guild.id, embed)
 
-    # ---- Auto-restore channels/roles if configured ----
+    # ---- Auto-restore ----
     if cfg["restore_channels"] and entry.action == discord.AuditLogAction.channel_delete:
         await restore_channel(guild, entry)
     if cfg["restore_roles"] and entry.action == discord.AuditLogAction.role_delete:
         await restore_role(guild, entry)
-
-    # ---- Webhook purge if many webhooks created quickly ----
-    if cfg["purge_webhooks"] and entry.action == discord.AuditLogAction.webhook_create:
-        # Check if the user has created too many webhooks (handled by check_action above)
-        # Also, if a nuke is detected, we purge all webhooks as a safety measure.
-        pass
-    # Additional: if webhook_create limit is exceeded, the punishment will trigger,
-    # and we can also add a one‑time purge for that user.
-    # This is already covered by the punishment function.
 
 # -------------------- RAID DETECTION --------------------
 @bot.event
@@ -279,7 +259,16 @@ async def on_member_join(member):
         cfg["raid_mode"] = False
         await log_event(guild.id, discord.Embed(description="✅ Raid mode disabled", color=discord.Color.green()))
 
-# -------------------- SLASH COMMANDS --------------------
+# -------------------- SLASH COMMANDS (with logging) --------------------
+async def log_setting_change(guild_id, user, setting, old_value, new_value):
+    embed = discord.Embed(
+        title="⚙️ **Anti-Nuke Setting Changed**",
+        description=f"**Changed by:** {user.mention}\n**Setting:** `{setting}`\n**Old value:** `{old_value}`\n**New value:** `{new_value}`",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    await log_event(guild_id, embed)
+
 @bot.tree.command(name="help", description="Show all commands")
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -288,10 +277,10 @@ async def help_cmd(interaction: discord.Interaction):
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(name="📊 `/status`", value="Current anti‑nuke settings", inline=False)
+    embed.add_field(name="📊 `/status`", value="Show current anti‑nuke settings", inline=False)
     embed.add_field(name="✅ `/enable`", value="Turn on protection", inline=False)
     embed.add_field(name="❌ `/disable`", value="Turn off protection (not recommended)", inline=False)
-    embed.add_field(name="⚙️ `/set`", value="Change a setting. Example: `/set max_bans 5`\n\n**Settings:**\n`max_bans`, `max_kicks`, `max_channel_deletes`, `max_role_deletes`, `max_webhook_creates`, `max_integration_create`, `max_channel_creates`, `max_role_creates`, `max_permission_updates`, `time_window`, `punishment`, `restore_channels`, `restore_roles`, `purge_webhooks`, `raid_join_threshold`", inline=False)
+    embed.add_field(name="⚙️ `/set`", value="Change a setting. Example: `/set max_bans 5`", inline=False)
     embed.add_field(name="🔨 `/punishment <type>`", value="`ban`, `kick`, `strip_roles`, `alert`", inline=False)
     embed.add_field(name="📝 `/setlogs #channel`", value="Set the log channel", inline=False)
     embed.add_field(name="🏓 `/ping`", value="Check bot latency", inline=False)
@@ -328,7 +317,9 @@ async def status_cmd(interaction: discord.Interaction):
 @commands.has_permissions(administrator=True)
 async def enable_cmd(interaction: discord.Interaction):
     cfg = get_config(interaction.guild_id)
+    old = cfg["enabled"]
     cfg["enabled"] = True
+    await log_setting_change(interaction.guild_id, interaction.user, "enabled", old, True)
     embed = discord.Embed(description="✅ **Anti-nuke protection is now ON**", color=discord.Color.green())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -336,7 +327,9 @@ async def enable_cmd(interaction: discord.Interaction):
 @commands.has_permissions(administrator=True)
 async def disable_cmd(interaction: discord.Interaction):
     cfg = get_config(interaction.guild_id)
+    old = cfg["enabled"]
     cfg["enabled"] = False
+    await log_setting_change(interaction.guild_id, interaction.user, "enabled", old, False)
     embed = discord.Embed(description="⚠️ **Anti-nuke protection is now OFF**", color=discord.Color.red())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -361,6 +354,7 @@ async def set_cmd(interaction: discord.Interaction, setting: str, value: str):
         val = value
     
     cfg[setting] = val
+    await log_setting_change(interaction.guild_id, interaction.user, setting, old, val)
     embed = discord.Embed(description=f"✅ Changed `{setting}` from `{old}` to `{val}`", color=discord.Color.green())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -371,7 +365,9 @@ async def punishment_cmd(interaction: discord.Interaction, punishment: str):
         await interaction.response.send_message("❌ Invalid punishment. Choose: `ban`, `kick`, `strip_roles`, `alert`", ephemeral=True)
         return
     cfg = get_config(interaction.guild_id)
+    old = cfg["punishment"]
     cfg["punishment"] = punishment
+    await log_setting_change(interaction.guild_id, interaction.user, "punishment", old, punishment)
     embed = discord.Embed(description=f"✅ Punishment set to `{punishment}`", color=discord.Color.green())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -379,7 +375,9 @@ async def punishment_cmd(interaction: discord.Interaction, punishment: str):
 @commands.has_permissions(administrator=True)
 async def setlogs_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     cfg = get_config(interaction.guild_id)
+    old = cfg.get("log_channel_id")
     cfg["log_channel_id"] = channel.id
+    await log_setting_change(interaction.guild_id, interaction.user, "log_channel_id", old, channel.id)
     embed = discord.Embed(description=f"✅ Logs will be sent to {channel.mention}", color=discord.Color.green())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
